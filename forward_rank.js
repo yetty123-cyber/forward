@@ -1,14 +1,15 @@
 const USER_AGENT = "TilingSales/2 CFNetwork/3860.500.112 Darwin/25.4.0";
+const PLAY_USER_AGENT = "AppleCoreMedia/1.0.0.21F90 (iPhone; U; CPU OS 17_5 like Mac OS X; zh_cn)";
 const LIB_CRYPTO_JS = "https://cdn.jsdelivr.net/npm/crypto-js@4.2.0/crypto-js.min.js";
 const LIB_JSENCRYPT = "https://cdn.jsdelivr.net/npm/jsencrypt@3.3.2/bin/jsencrypt.min.js";
 
 var WidgetMetadata = {
-  id: "https://t.me/Nzmgs?rev=20260427a",
+  id: "https://t.me/Nzmgs?rev=20260605b",
   title: "聚合实时榜单",
   description: "聚合各平台实时榜单数据",
   author: "TG@ZenMoFiShi",
   site: "https://t.me/Nzmgs",
-  version: "1.2.7",
+  version: "1.2.9",
   requiredVersion: "0.0.1",
   modules: [
     { title: "Netflix新片榜", description: "实时获取 Netflix 新片榜真实内容", requiresWebView: false, functionName: "getNetflixNew", cacheDuration: 120, params: [] },
@@ -261,7 +262,6 @@ async function mapRankItems(data) {
     else if (isAnime) cat = "anime";
     else if (isVariety) cat = "variety";
     else if (isDoc) cat = "documentary";
-    // genreTitle 中追加 [GXF cat=…|area=…] 标记，loadResource 端可解析回锁
     const gxfMarker = `[GXF cat=${cat}|area=${item.vod_area || item.area || ""}|t=${item.t_id || ""}|vid=${item.vod_id || ""}]`;
     const genreOut = (tagsArr.length ? tagsArr.join(" / ") + " " : "") + gxfMarker;
     if (entity && entity.id) {
@@ -393,7 +393,6 @@ function typeScoreByParams(item, params) {
   const tid = String(item.t_id || item.type_id || "");
   const cat = String(params.__gxfCategory || params.gxfCategory || "").toLowerCase();
   if (!tid) return 0;
-  // 强类别约束（动漫/综艺/纪录片/电影/电视剧），错类别一票否决式扣分
   if (cat === "anime") {
     if (tid === "4") return 80;
     if (tid === "1") return -200;
@@ -412,7 +411,6 @@ function typeScoreByParams(item, params) {
     if (tid === "1") return 60;
     return -200;
   }
-  // 默认 tv
   if (tid === "1") return -120;
   if (tid === "2") return 40;
   if (tid === "4") return -150;
@@ -426,7 +424,6 @@ function areaScore(item, params) {
   const got = String(item.vod_area || "").trim();
   if (!got) return 0;
   if (got === want) return 50;
-  // 大陆/中国互通
   if (/大陆|中国|内地/.test(want) && /大陆|中国|内地/.test(got)) return 50;
   return -40;
 }
@@ -459,21 +456,31 @@ function scoreCandidate(item, want, params) {
   score += typeScoreByParams(item, params);
   score += areaScore(item, params);
   score += actorScore(item, params);
-  if (want.season > 0 && seasonNum === want.season) score += 40;
-  if (want.season > 0 && seasonNum != null && seasonNum !== want.season) score -= 35;
+  const sameFranchise = !!want.baseNorm && (baseName === want.baseNorm || (!!want.fullNorm && normName === want.fullNorm));
+  if (want.season > 0 && sameFranchise) {
+    if (seasonNum === want.season) {
+      score += 300;                          
+    } else if (seasonNum != null) {
+      score -= 300;                          
+    } else if (want.season === 1) {
+      score += 100;                          
+    } else {
+      score -= 220;                          
+    }
+  } else if (want.season <= 0) {
+    if (seasonNum != null && seasonNum > 1) score -= 15;   
+  }
   if (want.year && year === want.year) score += 70;
   if (want.year && year && year !== want.year) score -= 20;
   if (/解说|速看|合集|全系列|电影解说|预告|花絮|彩蛋/.test(name)) score -= 80;
-  // 集数容量兜底：候选总集数若装不下 want.episode，强扣分（防止挑到只有 10 集的同名剧集）
   const wantEp = toInt(params.episode, 0);
   if (wantEp > 0) {
     const cap = toInt(item.vod_continu, 0) || toInt(item.d_total, 0) || toInt(item.vod_total, 0);
     if (cap > 0 && cap < wantEp) score -= 250;
   }
-  // 名称过度扩展惩罚（"完美世界" vs "完美世界：少年至尊篇" / "丈夫的完美世界"）
-  if (want.fullNorm && want.baseNorm && normName !== want.fullNorm && normName !== want.baseNorm) {
-    if (normName.length > Math.max(want.fullNorm.length, want.baseNorm.length) + 2) score -= 30;
-    if (!normName.startsWith(want.baseNorm) && want.baseNorm.length >= 4) score -= 20;
+  if (want.baseNorm && baseName !== want.baseNorm && (!want.fullNorm || normName !== want.fullNorm)) {
+    if (baseName.length > want.baseNorm.length + 2) score -= 30;
+    if (!baseName.startsWith(want.baseNorm) && want.baseNorm.length >= 4) score -= 25;
   }
   return score;
 }
@@ -546,6 +553,66 @@ function pickEpisode(list, params) {
   return null;
 }
 
+const GXF_FAKE_HOST_RE = /xn--55qx2ai23bz99b|(^|\.)(\u529e\u516c\u9694\u65ad)\.cn/i;
+
+function isFakePlayUrl(url) {
+  const u = String(url || "");
+  if (!u) return true;
+  return GXF_FAKE_HOST_RE.test(u);
+}
+
+async function probePlayUrl(url) {
+  // 拉一次 m3u8 核对真伪：命中占位域名、或呈现“占位宣传片”特征（极短时长）即判为占位。
+  // 源站对 VIP/被风控请求有两种投毒方式：302 跳占位域名，或用正常域名直接返回占位 m3u8。
+  try {
+    const probe = await Widget.http.get(url, { headers: { "User-Agent": PLAY_USER_AGENT }, allow_redirects: false });
+    const loc = probe && probe.headers && (probe.headers.location || probe.headers.Location);
+    if (loc) return isFakePlayUrl(loc) ? null : loc;
+    const body = typeof probe.data === "string" ? probe.data : "";
+    if (body) {
+      if (GXF_FAKE_HOST_RE.test(body)) return null;
+      // master playlist（含子流）不含 EXTINF，无法在此判时长，直接放行
+      if (/#EXT-X-STREAM-INF/i.test(body)) return url;
+      if (/#EXTINF/i.test(body)) {
+        let total = 0;
+        const re = /#EXTINF:([\d.]+)/g;
+        let m;
+        while ((m = re.exec(body)) !== null) total += parseFloat(m[1]) || 0;
+        // 占位宣传片约 100 秒；正片远长于此。带 ENDLIST 的完整短片才判占位，避免误伤直播/分段流。
+        if (total > 0 && total < 200 && /#EXT-X-ENDLIST/i.test(body)) return null;
+      }
+    }
+    return url;
+  } catch (e) {
+    return url;
+  }
+}
+
+async function resolveOneRes(q, res) {
+  // 单清晰度解析：源站 CDN 会秒级随机把真实流投毒成“占位宣传片”（约100秒，跳/直出“办公隔断.cn”）。
+  // 占位检测命中即重试 showOne 换新签名地址，多试几次以命中正片窗口；全失败才放弃该清晰度。
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let data = null;
+    try {
+      data = await privatePost("/App/Resource/VurlDetail/showOne", {
+        vod_d_id: q.vod_d_id,
+        vurl_id: q.vurl_id,
+        domain_type: q.domain_type,
+        resolution: res,
+        type: "play"
+      });
+    } catch (e) {
+      data = null;
+    }
+    if (data && data.url && !isFakePlayUrl(data.url)) {
+      const real = await probePlayUrl(data.url);
+      if (real) return { url: real, vip: data.vip, m3u8: data.m3u8 };
+    }
+    await new Promise(r => setTimeout(r, 700));
+  }
+  return null;
+}
+
 async function resolvePlayUrls(ep) {
   const out = [];
   for (const res of ["1080", "720", "480"]) {
@@ -553,26 +620,21 @@ async function resolvePlayUrls(ep) {
     if (!slot.param || String(slot.show_type) !== "0") continue;
     const q = parseParamQuery(slot.param);
     if (!q.vod_d_id || !q.vurl_id) continue;
-    try {
-      const data = await privatePost("/App/Resource/VurlDetail/showOne", {
-        vod_d_id: q.vod_d_id,
-        vurl_id: q.vurl_id,
-        domain_type: q.domain_type,
-        resolution: res,
-        type: "play"
+    const r = await resolveOneRes(q, res);
+    if (r && r.url) {
+      out.push({
+        name: `瓜子影视 ${res}P`,
+        description: [
+          `清晰度：${res}P`,
+          r.vip ? `VIP：${r.vip}` : "",
+          r.m3u8 ? `m3u8：${r.m3u8}` : ""
+        ].filter(Boolean).join("\n"),
+        url: r.url,
+        // CDN 按 UA 投毒，播放时必须带 AppleCoreMedia UA 才能拿到正片而非占位宣传片。
+        customHeaders: { "User-Agent": PLAY_USER_AGENT },
+        headers: { "User-Agent": PLAY_USER_AGENT }
       });
-      if (data && data.url) {
-        out.push({
-          name: `瓜子影视 ${res}P`,
-          description: [
-            `清晰度：${res}P`,
-            data.vip ? `VIP：${data.vip}` : "",
-            data.m3u8 ? `m3u8：${data.m3u8}` : ""
-          ].filter(Boolean).join("\n"),
-          url: data.url
-        });
-      }
-    } catch (e) {}
+    }
   }
   return out;
 }
@@ -625,7 +687,6 @@ async function loadResource(params) {
   const searchData = await privatePost("/App/Index/findMoreVod", { keywords: searchKeyword, order_val: "" });
   const best = pickBestVod(searchData && searchData.list, enrichedParams);
   if (!best || !best.vod_id) return [];
-  // 前置检查：用户请求集数 > 该 vod 已更新集数 → 直接返回空（避免兜底到第 1 集）
   const wantEp = toInt(params.episode, 0);
   if (params.type !== "movie" && wantEp > 0) {
     const updated = toInt(best.vod_continu, 0);
